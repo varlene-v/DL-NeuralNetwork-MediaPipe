@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Live Pose Overlay</title>
+  <style>
+    body   { margin:0; overflow:hidden; }
+    video  { display:none; }
+    canvas { display:block; }
+  </style>
+</head>
+<body>
+  <video id="input_video" autoplay playsinline></video>
+  <canvas id="output_canvas"></canvas>
+
+  <!-- 1) Load MediaPipe UMD bundles -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose"></script>
+
+  <script>
+    const videoElem  = document.getElementById('input_video');
+    const canvasElem = document.getElementById('output_canvas');
+    const ctx        = canvasElem.getContext('2d');
+
+    // 2) Initialize the Pose solution
+    const pose = new Pose({
+      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`
+    });
+    pose.setOptions({
+      modelComplexity:        2,
+      smoothLandmarks:        true,
+      refineLandmarks:        true,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence:  0.7
+    });
+    pose.onResults(onResults);
+
+    // 3) Hook up the camera
+    const camera = new Camera(videoElem, {
+      onFrame: async () => await pose.send({image: videoElem}),
+      width: 1280,
+      height: 720
+    });
+    camera.start();
+
+    // 4) Render loop: draw video + skeleton overlay
+    function onResults(results) {
+      const w = videoElem.videoWidth, h = videoElem.videoHeight;
+      canvasElem.width  = w;
+      canvasElem.height = h;
+
+      // always draw the camera frame first
+      ctx.drawImage(results.image, 0, 0, w, h);
+
+      // if no pose found, skip skeleton draw
+      if (!results.poseLandmarks) {
+        return;
+      }
+
+      // draw skeleton connections
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth   = 1;
+      for (const [i, j] of POSE_CONNECTIONS) {
+        const A = results.poseLandmarks[i];
+        const B = results.poseLandmarks[j];
+        if (A.visibility < 0.5 || B.visibility < 0.5) continue;
+        ctx.beginPath();
+        ctx.moveTo(A.x * w, A.y * h);
+        ctx.lineTo(B.x * w, B.y * h);
+        ctx.stroke();
+      }
+
+      // draw landmarks + index labels
+      ctx.fillStyle = 'white';
+      ctx.font      = '10px sans-serif';
+      results.poseLandmarks.forEach((lm, idx) => {
+        if (lm.visibility < 0.5) return;
+        const x = lm.x * w, y = lm.y * h;
+        ctx.beginPath();
+        ctx.arc(x, y, 2, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.fillText(idx, x + 4, y - 4);
+      });
+    }
+  </script>
+</body>
+</html>

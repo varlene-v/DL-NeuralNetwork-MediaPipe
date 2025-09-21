@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pose — Front Cam (iPad 11”, 16:9 portrait cover, counter + keypoints)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+  <style>
+    :root { color-scheme: dark; }
+    html, body {
+      margin:0; padding:0; height:100%; background:#000; overflow:hidden;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    /* Stage fills the entire screen; we’ll draw a 9:16 portrait canvas that covers it */
+    #stage {
+      position:fixed; inset:0; overflow:hidden; background:#000;
+    }
+    /* The canvas keeps a 9:16 portrait aspect and is as wide as the screen.
+       That means it can be taller than the screen; we center it vertically and clip overflow.
+       => No left/right black margins. */
+    #output {
+      position:absolute; left:50%; top:50%;
+      transform:translate(-50%,-50%);
+      width:100vw; height:calc(100vw * 16 / 9);  /* 9:16 portrait */
+      display:block; background:#000;
+      image-rendering: crisp-edges;
+      image-rendering: -webkit-optimize-contrast;
+    }
+    #video { display:none; } /* hidden feed; we draw to canvas */
+
+    /* HUD */
+    #hud {
+      position:fixed; top:10px; left:10px; z-index:5;
+      background:rgba(0,0,0,0.5); border:1px solid rgba(255,255,255,0.25);
+      color:#fff; padding:6px 10px; border-radius:10px;
+      font:600 12px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      user-select:none; -webkit-user-select:none;
+    }
+
+    /* Start overlay */
+    #ui {
+      position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+      background:rgba(0,0,0,0.85); z-index:6;
+    }
+    #startBtn {
+      font:600 16px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      padding:14px 18px; border-radius:12px; border:none; cursor:pointer;
+    }
+
+    #err {
+      position:fixed; left:0; right:0; bottom:0; z-index:7;
+      color:#f55; font:13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      padding:10px 14px; background:rgba(0,0,0,0.6); white-space:pre-wrap;
+      max-height:45%; overflow:auto;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="output"></canvas>
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+
+  <div id="hud">frames: 0/1000 | keypoints: 0/33</div>
+
+  <div id="ui"><button id="startBtn">Start Camera</button></div>
+  <div id="err" hidden></div>
+
+  <!-- MediaPipe Pose (version pinned for Safari stability) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.5/drawing_utils.js"></script>
+
+  <script>
+    const video    = document.getElementById('video');
+    const canvas   = document.getElementById('output');
+    const ctx      = canvas.getContext('2d');
+    const ui       = document.getElementById('ui');
+    const startBtn = document.getElementById('startBtn');
+    const errBox   = document.getElementById('err');
+    const hud      = document.getElementById('hud');
+
+    // Counters
+    let frameCount = 0;             // loops 0..999
+    const MAX_FRAMES = 1000;
+    const KEYPOINTS_TOTAL = 33;
+    const VIS_THRESH = 0.10;        // consider point "present" if visibility >= 0.10
+
+    // Performance tuning
+    const DPR_CAP = 2; // cap devicePixelRatio for speed on iPad
+    let pose = null;
+    let rafId = null;
+
+    function showError(e) {
+      errBox.hidden = false;
+      errBox.textContent = (e && e.message) ? e.message : String(e);
+      console.error(e);
+    }
+    function clearError() { errBox.hidden = true; errBox.textContent = ''; }
+
+    // Robust Pose API getter (UMD shapes vary)
+    function getPoseAPI() {
+      const ns = window.Pose || window.mpPose || window.pose || null;
+      if (!ns) return null;
+      return {
+        PoseClass: ns.Pose || ns,
+        POSE_CONNECTIONS: ns.POSE_CONNECTIONS || window.POSE_CONNECTIONS || []
+      };
+    }
+
+    // Set canvas internal pixel size to match its CSS size (which is 9:16 portrait cover of width=100vw)
+    function sizeCanvasToCSS() {
+      const rect = canvas.getBoundingClientRect();  // css pixels
+      const dpr = Math.min(DPR_CAP, Math.max(1, window.devicePixelRatio || 1));
+      canvas.width  = Math.round(rect.width  * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.scale(dpr, dpr);
+    }
+
+    // Draw the video into the canvas covering the full canvas (no letterbox) with proper aspect.
+    // Since our canvas is 9:16 portrait by CSS, we compute a "cover" drawImage.
+    function drawVideoCover() {
+      const destW = canvas.clientWidth;
+      const destH = canvas.clientHeight;
+
+      const srcW = video.videoWidth  || 1280;
+      const srcH = video.videoHeight || 720;
+
+      // Scale to cover
+      const scale = Math.max(destW / srcW, destH / srcH);
+      const drawW = srcW * scale;
+      const drawH = srcH * scale;
+      const dx = (destW - drawW) / 2;
+      const dy = (destH - drawH) / 2;
+
+      ctx.drawImage(video, dx, dy, drawW, drawH);
+      // Return mapping helpers for landmark normalization -> canvas CSS pixels
+      // Since we've drawn with cover, normalized (0..1) *after scaling* must be mapped using dest size and offsets.
+      return {
+        mapX: x => dx + x * drawW,
+        mapY: y => dy + y * drawH
+      };
+    }
+
+    function updateHUD(presentCount) {
+      hud.textContent = `frames: ${frameCount}/${MAX_FRAMES} | keypoints: ${presentCount}/${KEYPOINTS_TOTAL}`;
+    }
+
+    function drawResults(results, POSE_CONNECTIONS) {
+      // Clear whole CSS area (use clientWidth/Height because we scaled context for DPR already)
+      ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+
+      // Draw camera frame covering the canvas (no side margins)
+      const { mapX, mapY } = drawVideoCover();
+
+      // Count present keypoints & draw skeleton
+      const lms = results && results.poseLandmarks || [];
+      let present = 0;
+
+      // Skeleton connections in white
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#ffffff';
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '11px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+
+      // Draw connections
+      for (const [i, j] of POSE_CONNECTIONS) {
+        const A = lms[i], B = lms[j];
+        if (!A || !B) continue;
+        if ((A.visibility ?? 1) < VIS_THRESH || (B.visibility ?? 1) < VIS_THRESH) continue;
+        ctx.beginPath();
+        ctx.moveTo(mapX(A.x), mapY(A.y));
+        ctx.lineTo(mapX(B.x), mapY(B.y));
+        ctx.stroke();
+      }
+
+      // Draw dots + numeric labels (0..32)
+      for (let idx = 0; idx < lms.length; idx++) {
+        const p = lms[idx];
+        if (!p) continue;
+        const visOK = (p.visibility ?? 1) >= VIS_THRESH;
+        if (visOK) present++;
+        const x = mapX(p.x), y = mapY(p.y);
+        // dot
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
+        ctx.fill();
+        // label
+        ctx.fillText(String(idx), x + 5, y - 5);
+      }
+
+      // Frame counter (0..999 loop)
+      frameCount = (frameCount + 1) % MAX_FRAMES;
+      updateHUD(present);
+    }
+
+    async function init() {
+      try {
+        clearError();
+
+        // Request FRONT camera, prefer 60 fps @ 720p (stays smooth)
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: 'user' },
+            width:  { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 60, max: 60 }
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+
+        await new Promise(res => {
+          if (video.readyState >= 2) return res();
+          video.onloadedmetadata = () => res();
+        });
+
+        // Prepare canvas pixel size (DPR aware)
+        sizeCanvasToCSS();
+        // iPad rotation / resize handlers
+        window.addEventListener('resize', sizeCanvasToCSS);
+        window.addEventListener('orientationchange', () => setTimeout(sizeCanvasToCSS, 250));
+
+        // Load Pose
+        const api = getPoseAPI();
+        if (!api) throw new Error('MediaPipe Pose failed to load.');
+        const { PoseClass, POSE_CONNECTIONS } = api;
+
+        // Faster pose options for higher FPS
+        pose = new PoseClass({
+          locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${f}`
+        });
+        pose.setOptions({
+          modelComplexity: 1,         // lower = faster
+          smoothLandmarks: true,
+          refineLandmarks: false,     // off = faster
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+        pose.onResults(res => drawResults(res, POSE_CONNECTIONS));
+
+        // Frame loop — use rAF; Pose will run as fast as it can
+        async function loop() {
+          try { await pose.send({ image: video }); } catch (_) { /* ignore occasional drops */ }
+          rafId = requestAnimationFrame(loop);
+        }
+        loop();
+
+        ui.style.display = 'none';
+      } catch (e) {
+        showError(e);
+      }
+    }
+
+    startBtn.addEventListener('click', init, { once: true });
+
+    // Cleanup
+    window.addEventListener('pagehide', () => {
+      if (rafId) cancelAnimationFrame(rafId);
+      if (pose && pose.close) pose.close();
+      const s = video.srcObject;
+      if (s && s.getTracks) s.getTracks().forEach(t => t.stop());
+    });
+  </script>
+</body>
+</html>
