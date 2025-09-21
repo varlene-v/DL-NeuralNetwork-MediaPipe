@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pose — Columns with Data Frame Confidence (5×4)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+  <style>
+    :root { color-scheme: dark; }
+    html, body {
+      margin:0; padding:0; height:100%; overflow:hidden; background:#000;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    #stage { position:fixed; inset:0; overflow:hidden; background:#000; }
+    #output {
+      position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+      display:block; background:#000;
+      image-rendering: crisp-edges; image-rendering: -webkit-optimize-contrast;
+    }
+    #video { display:none; }
+    #hud {
+      position:fixed; top:10px; left:10px; z-index:5;
+      background:rgba(0,0,0,0.5); border:1px solid rgba(255,255,255,0.25);
+      color:#fff; padding:6px 10px; border-radius:10px;
+      font:600 12px/1.2 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      user-select:none; -webkit-user-select:none;
+    }
+    #ui {
+      position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+      background:rgba(0,0,0,0.85); z-index:6;
+    }
+    #startBtn {
+      font:600 16px/1.2 system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      padding:14px 18px; border-radius:12px; border:none; cursor:pointer;
+    }
+    #err {
+      position:fixed; left:0; right:0; bottom:0; z-index:7;
+      color:#f55; font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      padding:10px 14px; background:rgba(0,0,0,0.6); white-space:pre-wrap; max-height:45%; overflow:auto;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="output"></canvas>
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+
+  <div id="hud">frames: 0/1000 | keypoints: 0/33</div>
+  <div id="ui"><button id="startBtn">Start Camera</button></div>
+  <div id="err" hidden></div>
+
+  <!-- MediaPipe Pose -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.5/drawing_utils.js"></script>
+
+  <script>
+    // --- DOM & globals ---
+    const video    = document.getElementById('video');
+    const canvas   = document.getElementById('output');
+    const ctx      = canvas.getContext('2d');
+    const ui       = document.getElementById('ui');
+    const startBtn = document.getElementById('startBtn');
+    const errBox   = document.getElementById('err');
+    const hud      = document.getElementById('hud');
+
+    const DPR_CAP = 2;
+    const VIS_THRESH = 0.10;
+    const KEYPOINTS_TOTAL = 33;
+    const MAX_FRAMES = 1000;
+    let frameCount = 0;
+    let pose = null, rafId = null;
+
+    // Limb indices
+    const IDX = {
+      L_UPPER: [11,13,15],
+      R_UPPER: [12,14,16],
+      L_LOWER: [23,25,27,29,31],
+      R_LOWER: [24,26,28,30,32],
+    };
+
+    // Labels for selected joints
+    const LABELS = {
+      11:'shoulder', 13:'elbow', 15:'wrist',
+      12:'shoulder', 14:'elbow', 16:'wrist',
+      23:'hip', 25:'knee', 27:'ankle', 29:'heel', 31:'foot',
+      24:'hip', 26:'knee', 28:'ankle', 30:'heel', 32:'foot'
+    };
+
+    // Rolling history (5 rows): each entry is {conf,x,y,z}
+    const HIST_MAX = 5;
+    const CONF_THRESH = 0.8;
+    const hist = {
+      upper: [],
+      lower: []
+    };
+
+    function showError(e){ errBox.hidden=false; errBox.textContent=(e&&e.message)?e.message:String(e); console.error(e); }
+    function clearError(){ errBox.hidden=true; errBox.textContent=''; }
+    function getPoseAPI(){
+      const ns = window.Pose || window.mpPose || window.pose || null;
+      if(!ns) return null;
+      return { PoseClass: ns.Pose || ns, POSE_CONNECTIONS: ns.POSE_CONNECTIONS || window.POSE_CONNECTIONS || [] };
+    }
+
+    // Canvas sizing:
+    // - Portrait: strict 4:3 "contain"
+    // - Landscape: fill width via "cover" (no side margins)
+    function sizeCanvas(){
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const isLandscape = vw > vh;
+      let cssW, cssH;
+
+      if (isLandscape) { cssW = vw; cssH = vh; }
+      else {
+        const targetAspect = 4/3;
+        if (vw / vh > targetAspect) { cssH = vh; cssW = Math.round(cssH * targetAspect); }
+        else                        { cssW = vw; cssH = Math.round(cssW / targetAspect); }
+      }
+
+      canvas.style.width  = cssW + 'px';
+      canvas.style.height = cssH + 'px';
+
+      const dpr = Math.min(DPR_CAP, Math.max(1, window.devicePixelRatio || 1));
+      canvas.width  = Math.round(cssW * dpr);
+      canvas.height = Math.round(cssH * dpr);
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.scale(dpr, dpr);
+    }
+
+    // Video drawing helpers
+    function drawVideoContain(){
+      const destW = canvas.clientWidth, destH = canvas.clientHeight;
+      const srcW = video.videoWidth || 1280;
+      const srcH = video.videoHeight || 960;
+      const scale = Math.min(destW/srcW, destH/srcH);
+      const drawW = srcW*scale, drawH = srcH*scale;
+      const dx = (destW - drawW)/2, dy = (destH - drawH)/2;
+      ctx.drawImage(video, dx, dy, drawW, drawH);
+      return { mapX: x => dx + x*drawW, mapY: y => dy + y*drawH };
+    }
+    function drawVideoCover(){
+      const destW = canvas.clientWidth, destH = canvas.clientHeight;
+      const srcW = video.videoWidth || 1280;
+      const srcH = video.videoHeight || 720;
+      const scale = Math.max(destW/srcW, destH/srcH);
+      const drawW = srcW*scale, drawH = srcH*scale;
+      const dx = (destW - drawW)/2, dy = (destH - drawH)/2;
+      ctx.drawImage(video, dx, dy, drawW, drawH);
+      return { mapX: x => dx + x*drawW, mapY: y => dy + y*drawH };
+    }
+
+    function polyFromIndices(lms, idxs, mapX, mapY){
+      return idxs.map(i=>{
+        const p = lms[i];
+        return p ? { x: mapX(p.x), y: mapY(p.y), z: (typeof p.z==='number'?p.z:0), v:(p.visibility??1), idx:i } : null;
+      }).filter(Boolean);
+    }
+    function drawPolyline(pts, alpha=1){
+      if (pts.length < 2) return;
+      ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    function lerp(a,b,t){ return a + (b-a)*t; }
+    function tweenPolylines(A,B,steps){
+      const out = []; const n = Math.min(A.length, B.length);
+      for (let s=1; s<=steps; s++){
+        const t = s/(steps+1);
+        out.push(Array.from({length:n},(_,i)=>({ x: lerp(A[i].x,B[i].x,t), y: lerp(A[i].y,B[i].y,t) })));
+      }
+      return out;
+    }
+    function fillSurfaceBetweenPolylines(lines, color, alpha, clipRect){
+      if (lines.length < 2) return;
+      ctx.save();
+      if (clipRect){ ctx.beginPath(); ctx.rect(clipRect.x, clipRect.y, clipRect.w, clipRect.h); ctx.clip(); }
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = color;
+      for (let k=0; k<lines.length-1; k++){
+        const A = lines[k], B = lines[k+1];
+        const n = Math.min(A.length, B.length);
+        for (let i=0; i<n-1; i++){
+          ctx.beginPath();
+          ctx.moveTo(A[i].x,   A[i].y);
+          ctx.lineTo(A[i+1].x, A[i+1].y);
+          ctx.lineTo(B[i+1].x, B[i+1].y);
+          ctx.lineTo(B[i].x,   B[i].y);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+
+    // Keypoint labels near joints
+    function drawKeypointLabels(lms, indices, mapX, mapY){
+      ctx.save();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '11px system-ui,-apple-system,Segoe UI,Roboto,Arial';
+      indices.forEach(i=>{
+        const p = lms[i]; if (!p) return;
+        const x = mapX(p.x), y = mapY(p.y);
+        const name = LABELS[i] || '';
+        if (name) ctx.fillText(name, x + 6, y - 6);
+      });
+      ctx.restore();
+    }
+
+    // Averages for confidence + coordinates (normalized x/y, and z as given by MediaPipe)
+    function averagesForSet(lms, indices){
+      let sumV=0, sumX=0, sumY=0, sumZ=0, n=0;
+      indices.forEach(i=>{
+        const p = lms[i];
+        if (p){
+          const v = (typeof p.visibility==='number') ? p.visibility : 0;
+          sumV += v;
+          sumX += (typeof p.x==='number') ? p.x : 0;
+          sumY += (typeof p.y==='number') ? p.y : 0;
+          sumZ += (typeof p.z==='number') ? p.z : 0;
+          n++;
+        }
+      });
+      if (!n) return { conf:0, x:0, y:0, z:0 };
+      return { conf: sumV/n, x: sumX/n, y: sumY/n, z: sumZ/n };
+    }
+
+    function pushHist(arr, obj){
+      arr.unshift(obj);                 // newest first
+      if (arr.length > HIST_MAX) arr.pop();
+    }
+
+    // Draw a 4-column × up-to-5-row table inside a row box (transparent background).
+    // Columns: Conf | X | Y | Z
+    function drawDataFrameRow(x, y, w, h, rows, headerLabel){
+      ctx.save();
+      // Clip to row rect
+      ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+
+      const cols = ['Conf','X','Y','Z'];
+      const colW = w / cols.length;
+
+      // Header bar (no background fill, just text)
+      const headerY = y + 14;
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+      cols.forEach((c, ci)=>{
+        const tx = x + ci*colW + 6;
+        ctx.fillText(c, tx, headerY);
+      });
+
+      // Grid lines (optional thin separators for readability)
+      ctx.globalAlpha = 0.4;
+      ctx.beginPath();
+      for (let ci=1; ci<cols.length; ci++){
+        const gx = x + ci*colW;
+        ctx.moveTo(gx, y); ctx.lineTo(gx, y+h);
+      }
+      ctx.moveTo(x, y+18); ctx.lineTo(x+w, y+18);
+      ctx.strokeStyle = '#ffffff';
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      // Rows (up to 5, newest first)
+      const availableH = h - 20; // below header line
+      const rCount = Math.min(rows.length, HIST_MAX);
+      const rH = availableH / (rCount || 1);
+      ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+
+      for (let i=0; i<rCount; i++){
+        const row = rows[i];
+        const cy = y + 20 + i*rH + rH*0.7; // baseline
+        const cells = [
+          row.conf.toFixed(2),
+          row.x.toFixed(2),
+          row.y.toFixed(2),
+          row.z.toFixed(2)
+        ];
+        cells.forEach((val, ci)=>{
+          const tx = x + ci*colW + 6;
+          ctx.fillText(val, tx, cy);
+        });
+      }
+
+      // Corner label (left-top of this row)
+      if (headerLabel){
+        ctx.font = '11px system-ui,-apple-system,Segoe UI,Roboto,Arial';
+        ctx.fillText(headerLabel, x + 6, y + h - 6);
+      }
+
+      ctx.restore();
+    }
+
+    // Columns along left & right edges, 4 equal rows each (landscape only)
+    function drawEdgeColumns(upperPair, lowerPair, confU, confL){
+      const vw = canvas.clientWidth, vh = canvas.clientHeight;
+      const isLandscape = vw > vh; if (!isLandscape) return;
+
+      const pad = 12;
+      const colWDesired = Math.min(260, vw * 0.32);
+      const rowHDesired = Math.min(160, vh * 0.28);
+
+      // Keep rows as large as possible; scale down only if needed
+      const gaps = 3, gapSize = 8;
+      let rowH = rowHDesired;
+      const neededH = rowHDesired*4 + gaps*gapSize;
+      if (neededH > vh - 2*pad){
+        const avail = vh - 2*pad - gaps*gapSize;
+        rowH = Math.max(40, Math.floor(avail/4));
+      }
+      const colH = rowH*4 + gaps*gapSize;
+      const topY = (vh - colH) / 2;
+
+      const leftX  = pad;
+      const rightX = vw - colWDesired - pad;
+      const colW   = colWDesired;
+
+      function computeBBox(L, R){
+        const all = [...L, ...R]; if (!all.length) return {minX:0,minY:0,w:1,h:1};
+        const minX = Math.min(...all.map(p=>p.x));
+        const maxX = Math.max(...all.map(p=>p.x));
+        const minY = Math.min(...all.map(p=>p.y));
+        const maxY = Math.max(...all.map(p=>p.y));
+        return { minX, minY, w: Math.max(1,maxX-minX), h: Math.max(1,maxY-minY) };
+      }
+      function mapSet(pts, x, y, w, h, bbox){
+        const pp = 8;
+        const sx = (w - 2*pp) / bbox.w;
+        const sy = (h - 2*pp) / bbox.h;
+        const scale = Math.min(sx, sy);
+        const ox = x + pp + (w - 2*pp - bbox.w*scale)/2;
+        const oy = y + pp + (h - 2*pp - bbox.h*scale)/2;
+        return pts.map(p => ({ x: ox + (p.x - bbox.minX)*scale, y: oy + (p.y - bbox.minY)*scale }));
+      }
+
+      ctx.save();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#ffffff';
+      ctx.fillStyle = '#ffffff';
+
+      function drawColumn(x, pair, conf, histArr, labelText){
+        const L = pair.L, R = pair.R;
+        const bbox = computeBBox(L,R);
+
+        // Row rects (top→bottom)
+        const row1 = {x, y: topY + 0*(rowH + gapSize), w: colW, h: rowH}; // conditional RED surface
+        const row2 = {x, y: topY + 1*(rowH + gapSize), w: colW, h: rowH}; // data frame table
+        const row3 = {x, y: topY + 2*(rowH + gapSize), w: colW, h: rowH}; // WHITE surface
+        const row4 = {x, y: topY + 3*(rowH + gapSize), w: colW, h: rowH}; // tweens
+
+        // Row 4: tweens
+        const L4 = mapSet(L, row4.x, row4.y, row4.w, row4.h, bbox);
+        const R4 = mapSet(R, row4.x, row4.y, row4.w, row4.h, bbox);
+        const tween4 = tweenPolylines(L4, R4, 5);
+        drawPolyline(L4, 1.0);
+        for (const t of tween4) drawPolyline(t, 0.45);
+        drawPolyline(R4, 1.0);
+
+        // Row 3: white surface (50%)
+        const L3 = mapSet(L, row3.x, row3.y, row3.w, row3.h, bbox);
+        const R3 = mapSet(R, row3.x, row3.y, row3.w, row3.h, bbox);
+        const tween3 = tweenPolylines(L3, R3, 5);
+        const lines3 = [L3, ...tween3, R3];
+        fillSurfaceBetweenPolylines(lines3, '#FFFFFF', 0.5, row3);
+
+        // Row 2: data frame table (Conf, X, Y, Z) — newest 5 entries, clipped to row
+        drawDataFrameRow(row2.x, row2.y, row2.w, row2.h, histArr, 'last 5');
+
+        // Row 1: conditional RED surface (50%) if conf > 0.8
+        if (conf > CONF_THRESH){
+          const L1 = mapSet(L, row1.x, row1.y, row1.w, row1.h, bbox);
+          const R1 = mapSet(R, row1.x, row1.y, row1.w, row1.h, bbox);
+          const tween1 = tweenPolylines(L1, R1, 5);
+          const lines1 = [L1, ...tween1, R1];
+          fillSurfaceBetweenPolylines(lines1, '#FF0000', 0.5, row1);
+        }
+
+        // Column label near bottom edge
+        ctx.font = '12px system-ui,-apple-system,Segoe UI,Roboto,Arial';
+        const labelX = (x === leftX) ? x : (x + colW - ctx.measureText(labelText).width);
+        ctx.fillText(labelText, labelX, Math.min(topY + rowH*4 + gapSize*3 + 18, canvas.clientHeight - 6));
+      }
+
+      // Left column: Upper limb | Right column: Lower limb
+      drawColumn(leftX,  upperPair, confU, hist.upper, 'Upper limb');
+      drawColumn(rightX, lowerPair, confL, hist.lower, 'Lower limb');
+
+      ctx.restore();
+    }
+
+    function updateHUD(present){
+      hud.textContent = `frames: ${frameCount}/${MAX_FRAMES} | keypoints: ${present}/${KEYPOINTS_TOTAL}`;
+    }
+
+    function drawResults(results, POSE_CONNECTIONS){
+      ctx.clearRect(0,0,canvas.clientWidth,canvas.clientHeight);
+
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const isLandscape = vw > vh;
+      const { mapX, mapY } = isLandscape ? drawVideoCover() : drawVideoContain();
+
+      const lms = (results && results.poseLandmarks) || [];
+      let present = 0;
+
+      // Full skeleton and indexed dots
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#ffffff';
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '11px system-ui,-apple-system,Segoe UI,Roboto,Arial';
+
+      for (const [i,j] of POSE_CONNECTIONS){
+        const A = lms[i], B = lms[j];
+        if (!A || !B) continue;
+        if ((A.visibility??1) < VIS_THRESH || (B.visibility??1) < VIS_THRESH) continue;
+        ctx.beginPath();
+        ctx.moveTo(mapX(A.x), mapY(A.y));
+        ctx.lineTo(mapX(B.x), mapY(B.y));
+        ctx.stroke();
+      }
+      for (let idx=0; idx<lms.length; idx++){
+        const p = lms[idx];
+        if (!p) continue;
+        if ((p.visibility??1) >= VIS_THRESH) present++;
+        const x = mapX(p.x), y = mapY(p.y);
+        ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fill();
+        ctx.fillText(String(idx), x+5, y-5);
+      }
+
+      // Moving joint-name labels
+      const upperIdx = [...IDX.L_UPPER, ...IDX.R_UPPER];
+      const lowerIdx = [...IDX.L_LOWER, ...IDX.R_LOWER];
+      drawKeypointLabels(lms, upperIdx, mapX, mapY);
+      drawKeypointLabels(lms, lowerIdx, mapX, mapY);
+
+      // Limb polylines for main canvas
+      const L_upper = polyFromIndices(lms, IDX.L_UPPER, mapX, mapY);
+      const R_upper = polyFromIndices(lms, IDX.R_UPPER, mapX, mapY);
+      const L_lower = polyFromIndices(lms, IDX.L_LOWER, mapX, mapY);
+      const R_lower = polyFromIndices(lms, IDX.R_LOWER, mapX, mapY);
+
+      drawPolyline(L_upper, 1); drawPolyline(R_upper, 1);
+      drawPolyline(L_lower, 1); drawPolyline(R_lower, 1);
+
+      // Averages for histories (computed on normalized coords)
+      const avgU = averagesForSet(lms, upperIdx);
+      const avgL = averagesForSet(lms, lowerIdx);
+      pushHist(hist.upper, avgU);
+      pushHist(hist.lower, avgL);
+
+      // Edge columns with 4 rows each (landscape only)
+      drawEdgeColumns({L:L_upper,R:R_upper}, {L:L_lower,R:R_lower}, avgU.conf, avgL.conf);
+
+      // Counters
+      frameCount = (frameCount + 1) % MAX_FRAMES;
+      updateHUD(present);
+    }
+
+    async function init(){
+      try{
+        clearError();
+
+        // Front camera (prefer 4:3, 60fps)
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: 'user' },
+            width:  { ideal: 1280 },
+            height: { ideal: 960 },          // 4:3 target
+            aspectRatio: { ideal: 4/3 },
+            frameRate: { ideal: 60, max: 60 }
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+
+        await new Promise(res => {
+          if (video.readyState >= 2) return res();
+          video.onloadedmetadata = () => res();
+        });
+
+        sizeCanvas();
+        window.addEventListener('resize', sizeCanvas);
+        window.addEventListener('orientationchange', () => setTimeout(sizeCanvas, 250));
+
+        const api = getPoseAPI();
+        if (!api) throw new Error('MediaPipe Pose failed to load.');
+        const { PoseClass, POSE_CONNECTIONS } = api;
+
+        pose = new PoseClass({
+          locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${f}`
+        });
+        pose.setOptions({
+          modelComplexity: 1,
+          smoothLandmarks: true,
+          refineLandmarks: false,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+        pose.onResults(res => drawResults(res, POSE_CONNECTIONS));
+
+        async function loop(){
+          try { await pose.send({ image: video }); } catch (_) {}
+          rafId = requestAnimationFrame(loop);
+        }
+        loop();
+
+        ui.style.display = 'none';
+      } catch(e){ showError(e); }
+    }
+
+    startBtn.addEventListener('click', init, { once:true });
+
+    window.addEventListener('pagehide', ()=>{
+      if (rafId) cancelAnimationFrame(rafId);
+      if (pose && pose.close) pose.close();
+      const s = video.srcObject;
+      if (s && s.getTracks) s.getTracks().forEach(t=>t.stop());
+    });
+  </script>
+</body>
+</html>
