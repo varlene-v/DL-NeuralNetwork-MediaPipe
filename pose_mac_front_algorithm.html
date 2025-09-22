@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pose — Algorithm: Half-Height Columns + 3cm Clustered Gallery</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+  <style>
+    :root { color-scheme: dark; }
+    html, body {
+      margin:0; padding:0; height:100%; overflow:hidden; background:#000;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    #stage { position:fixed; inset:0; overflow:hidden; background:#000; }
+    #output {
+      position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+      display:block; background:#000;
+      image-rendering: crisp-edges; image-rendering: -webkit-optimize-contrast;
+    }
+    #video { display:none; }
+    #hud {
+      position:fixed; top:10px; left:10px; z-index:5;
+      background:rgba(0,0,0,0.5); border:1px solid rgba(255,255,255,0.25);
+      color:#fff; padding:6px 10px; border-radius:10px;
+      font:600 12px/1.2 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      user-select:none; -webkit-user-select:none;
+    }
+    #ui {
+      position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+      background:rgba(0,0,0,0.85); z-index:6;
+    }
+    #startBtn {
+      font:600 16px/1.2 system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      padding:14px 18px; border-radius:12px; border:none; cursor:pointer;
+    }
+    #err {
+      position:fixed; left:0; right:0; bottom:0; z-index:7;
+      color:#f55; font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      padding:10px 14px; background:rgba(0,0,0,0.6); white-space:pre-wrap; max-height:45%; overflow:auto;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="output"></canvas>
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+
+  <div id="hud">frames: 0/1000 | keypoints: 0/33</div>
+  <div id="ui"><button id="startBtn">Start Camera</button></div>
+  <div id="err" hidden></div>
+
+  <!-- MediaPipe Pose -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.5/drawing_utils.js"></script>
+
+  <script>
+    // DOM + globals
+    const video    = document.getElementById('video');
+    const canvas   = document.getElementById('output');
+    const ctx      = canvas.getContext('2d');
+    const ui       = document.getElementById('ui');
+    const startBtn = document.getElementById('startBtn');
+    const errBox   = document.getElementById('err');
+    const hud      = document.getElementById('hud');
+
+    const DPR_CAP = 2;
+    const VIS_THRESH = 0.10;
+    const KEYPOINTS_TOTAL = 33;
+    const MAX_FRAMES = 1000;
+    let frameCount = 0;
+    let pose = null, rafId = null;
+
+    // Limb indices
+    const IDX = {
+      L_UPPER: [11,13,15],
+      R_UPPER: [12,14,16],
+      L_LOWER: [23,25,27,29,31],
+      R_LOWER: [24,26,28,30,32],
+    };
+
+    // Rolling history (5 rows): each entry is {conf,x,y,z}
+    const HIST_MAX = 5;
+    const CONF_THRESH = 0.8;
+
+    const hist = { upper: [], lower: [] };
+
+    // Collector (right side, narrow): 1 col × 10 rows (fits 3cm width)
+    const GALLERY_ROWS = 10;
+    const GALLERY_COLS = 1;
+    const GALLERY_MAX  = GALLERY_ROWS * GALLERY_COLS; // 10
+    let galleryIdx = 0;
+    // Each entry: { Luv:[{u,v}...], Ruv:[{u,v}...], feature:number[], cluster:number }
+    const gallery = Array(GALLERY_MAX).fill(null);
+
+    // K-means (k=5)
+    const K = 5;
+    const CLUSTER_META = [
+      { color:'#00FFFF', name:'stand' }, // 0 cyan
+      { color:'#FF0000', name:'run'   }, // 1 red
+      { color:'#FFFF00', name:'jump'  }, // 2 yellow
+      { color:'#0000FF', name:'walk'  }, // 3 blue
+      { color:'#FFA500', name:'swing' }  // 4 orange
+    ];
+
+    // Labels for selected joints
+    const LABELS = {
+      11:'shoulder', 13:'elbow', 15:'wrist',
+      12:'shoulder', 14:'elbow', 16:'wrist',
+      23:'hip', 25:'knee', 27:'ankle', 29:'heel', 31:'foot',
+      24:'hip', 26:'knee', 28:'ankle', 30:'heel', 32:'foot'
+    };
+
+    // ---- utilities ----
+    function showError(e){ errBox.hidden=false; errBox.textContent=(e&&e.message)?e.message:String(e); console.error(e); }
+    function clearError(){ errBox.hidden=true; errBox.textContent=''; }
+    function getPoseAPI(){
+      const ns = window.Pose || window.mpPose || window.pose || null;
+      if(!ns) return null;
+      return { PoseClass: ns.Pose || ns, POSE_CONNECTIONS: ns.POSE_CONNECTIONS || window.POSE_CONNECTIONS || [] };
+    }
+
+    // Canvas sizing: portrait strict 4:3 contain, landscape cover (no side margins)
+    function sizeCanvas(){
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const isLandscape = vw > vh;
+      let cssW, cssH;
+
+      if (isLandscape) { cssW = vw; cssH = vh; }
+      else {
+        const targetAspect = 4/3;
+        if (vw / vh > targetAspect) { cssH = vh; cssW = Math.round(cssH * targetAspect); }
+        else                        { cssW = vw; cssH = Math.round(cssW / targetAspect); }
+      }
+
+      canvas.style.width  = cssW + 'px';
+      canvas.style.height = cssH + 'px';
+
+      const dpr = Math.min(DPR_CAP, Math.max(1, window.devicePixelRatio || 1));
+      canvas.width  = Math.round(cssW * dpr);
+      canvas.height = Math.round(cssH * dpr);
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.scale(dpr, dpr);
+    }
+
+    // Video drawing helpers
+    function drawVideoContain(){
+      const destW = canvas.clientWidth, destH = canvas.clientHeight;
+      const srcW = video.videoWidth || 1280;
+      const srcH = video.videoHeight || 960;
+      const scale = Math.min(destW/srcW, destH/srcH);
+      const drawW = srcW*scale, drawH = srcH*scale;
+      const dx = (destW - drawW)/2, dy = (destH - drawH)/2;
+      ctx.drawImage(video, dx, dy, drawW, drawH);
+      return { mapX: x => dx + x*drawW, mapY: y => dy + y*drawH };
+    }
+    function drawVideoCover(){
+      const destW = canvas.clientWidth, destH = canvas.clientHeight;
+      const srcW = video.videoWidth || 1280;
+      const srcH = video.videoHeight || 720;
+      const scale = Math.max(destW/srcW, destH/srcH);
+      const drawW = srcW*scale, drawH = srcH*scale;
+      const dx = (destW - drawW)/2, dy = (destH - drawH)/2;
+      ctx.drawImage(video, dx, dy, drawW, drawH);
+      return { mapX: x => dx + x*drawW, mapY: y => dy + y*drawH };
+    }
+
+    // Polylines
+    function polyFromIndices(lms, idxs, mapX, mapY){
+      return idxs.map(i=>{
+        const p = lms[i];
+        return p ? { x: mapX(p.x), y: mapY(p.y), z:(typeof p.z==='number'?p.z:0), v:(p.visibility??1), idx:i } : null;
+      }).filter(Boolean);
+    }
+    function drawPolyline(pts, alpha=1){
+      if (pts.length < 2) return;
+      ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    function lerp(a,b,t){ return a + (b-a)*t; }
+    function tweenPolylines(A,B,steps){
+      const out = []; const n = Math.min(A.length, B.length);
+      for (let s=1; s<=steps; s++){
+        const t = s/(steps+1);
+        out.push(Array.from({length:n},(_,i)=>({ x: lerp(A[i].x,B[i].x,t), y: lerp(A[i].y,B[i].y,t) })));
+      }
+      return out;
+    }
+    function fillSurfaceBetweenPolylines(lines, color, alpha, clipRect){
+      if (lines.length < 2) return;
+      ctx.save();
+      if (clipRect){ ctx.beginPath(); ctx.rect(clipRect.x, clipRect.y, clipRect.w, clipRect.h); ctx.clip(); }
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = color;
+      for (let k=0; k<lines.length-1; k++){
+        const A = lines[k], B = lines[k+1];
+        const n = Math.min(A.length, B.length);
+        for (let i=0; i<n-1; i++){
+          ctx.beginPath();
+          ctx.moveTo(A[i].x,   A[i].y);
+          ctx.lineTo(A[i+1].x, A[i+1].y);
+          ctx.lineTo(B[i+1].x, B[i+1].y);
+          ctx.lineTo(B[i].x,   B[i].y);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+
+    // Joint labels near points
+    function drawKeypointLabels(lms, indices, mapX, mapY){
+      ctx.save();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '11px system-ui,-apple-system,Segoe UI,Roboto,Arial';
+      indices.forEach(i=>{
+        const p = lms[i]; if (!p) return;
+        const x = mapX(p.x), y = mapY(p.y);
+        const name = LABELS[i] || '';
+        if (name) ctx.fillText(name, x + 6, y - 6);
+      });
+      ctx.restore();
+    }
+
+    // Averages for data-frame rows
+    function averagesForSet(lms, indices){
+      let sumV=0, sumX=0, sumY=0, sumZ=0, n=0;
+      indices.forEach(i=>{
+        const p = lms[i];
+        if (p){
+          const v = (typeof p.visibility==='number') ? p.visibility : 0;
+          sumV += v; sumX += (p.x||0); sumY += (p.y||0); sumZ += (p.z||0);
+          n++;
+        }
+      });
+      if (!n) return { conf:0, x:0, y:0, z:0 };
+      return { conf: sumV/n, x: sumX/n, y: sumY/n, z: sumZ/n };
+    }
+    function pushHist(arr, obj){ arr.unshift(obj); if (arr.length > HIST_MAX) arr.pop(); }
+
+    // Data-frame row renderer (Conf|X|Y|Z × up to 5)
+    function drawDataFrameRow(x, y, w, h, rows, headerLabel){
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+
+      const cols = ['Conf','X','Y','Z'];
+      const colW = w / cols.length;
+
+      // header
+      const headerY = y + 14;
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+      cols.forEach((c, ci)=> ctx.fillText(c, x + ci*colW + 6, headerY));
+
+      // separators
+      ctx.globalAlpha = 0.4;
+      ctx.beginPath();
+      for (let ci=1; ci<cols.length; ci++){
+        const gx = x + ci*colW; ctx.moveTo(gx, y); ctx.lineTo(gx, y+h);
+      }
+      ctx.moveTo(x, y+18); ctx.lineTo(x+w, y+18);
+      ctx.strokeStyle = '#ffffff'; ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      // rows
+      const availableH = h - 20;
+      const rCount = Math.min(rows.length, HIST_MAX);
+      const rH = availableH / (rCount || 1);
+      ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+
+      for (let i=0; i<rCount; i++){
+        const row = rows[i];
+        const cy = y + 20 + i*rH + rH*0.7;
+        const cells = [
+          row.conf.toFixed(2),
+          row.x.toFixed(2),
+          row.y.toFixed(2),
+          row.z.toFixed(2)
+        ];
+        cells.forEach((val, ci)=> ctx.fillText(val, x + ci*colW + 6, cy));
+      }
+
+      if (headerLabel){
+        ctx.font = '11px system-ui,-apple-system,Segoe UI,Roboto,Arial';
+        ctx.fillText(headerLabel, x + 6, y + h - 6);
+      }
+      ctx.restore();
+    }
+
+    // ---------- LEFT HALF (bottom-left): two columns, height limited to 50% of screen ----------
+    function drawLeftHalfColumns(upperPair, lowerPair, confU, confL, histU, histL){
+      const vw = canvas.clientWidth, vh = canvas.clientHeight;
+      const isLandscape = vw > vh; if (!isLandscape) return;
+
+      const pad = 12;
+      const leftW = Math.floor(vw/2) - pad;     // limit to half the screen width
+      const leftX = pad;
+      const bottomY = vh - pad;
+
+      // Columns sit side-by-side within left half
+      const colGap = 10;
+      const colW = Math.floor((leftW - colGap) / 2);
+
+      // Target row size; cap total height to 50% of screen
+      const desiredRowH = Math.min(160, vh * 0.22);
+      const gaps = 3, rowGap = 8;
+      let rowH = desiredRowH;
+      let colH = rowH*4 + gaps*rowGap;
+      const maxColH = Math.floor(vh * 0.5);     // <= 50% of screen height
+      if (colH > maxColH){
+        rowH = Math.max(36, Math.floor((maxColH - gaps*rowGap) / 4));
+        colH = rowH*4 + gaps*rowGap;
+      }
+      const topY = bottomY - colH;
+
+      // Helpers
+      function computeBBox(L, R){
+        const all = [...L, ...R]; if (!all.length) return {minX:0,minY:0,w:1,h:1};
+        const minX = Math.min(...all.map(p=>p.x));
+        const maxX = Math.max(...all.map(p=>p.x));
+        const minY = Math.min(...all.map(p=>p.y));
+        const maxY = Math.max(...all.map(p=>p.y));
+        return { minX, minY, w: Math.max(1,maxX-minX), h: Math.max(1,maxY-minY) };
+      }
+      function mapSet(pts, x, y, w, h, bbox){
+        const pp = 8;
+        const sx = (w - 2*pp) / bbox.w;
+        const sy = (h - 2*pp) / bbox.h;
+        const scale = Math.min(sx, sy);
+        const ox = x + pp + (w - 2*pp - bbox.w*scale)/2;
+        const oy = y + pp + (h - 2*pp - bbox.h*scale)/2;
+        return pts.map(p => ({ x: ox + (p.x - bbox.minX)*scale, y: oy + (p.y - bbox.minY)*scale }));
+      }
+
+      ctx.save();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#ffffff';
+      ctx.fillStyle = '#ffffff';
+
+      function drawColumn(x, pair, conf, histArr, labelText){
+        const L = pair.L, R = pair.R;
+        const bbox = computeBBox(L,R);
+
+        // Row rects (top→bottom)
+        const row1 = {x, y: topY + 0*(rowH + rowGap), w: colW, h: rowH}; // red if conf>0.8
+        const row2 = {x, y: topY + 1*(rowH + rowGap), w: colW, h: rowH}; // table
+        const row3 = {x, y: topY + 2*(rowH + rowGap), w: colW, h: rowH}; // white surface
+        const row4 = {x, y: topY + 3*(rowH + rowGap), w: colW, h: rowH}; // tweens
+
+        // Row 4: tweens
+        const L4 = mapSet(L, row4.x, row4.y, row4.w, row4.h, bbox);
+        const R4 = mapSet(R, row4.x, row4.y, row4.w, row4.h, bbox);
+        const tween4 = tweenPolylines(L4, R4, 5);
+        drawPolyline(L4, 1.0);
+        for (const t of tween4) drawPolyline(t, 0.45);
+        drawPolyline(R4, 1.0);
+
+        // Row 3: white surface
+        const L3 = mapSet(L, row3.x, row3.y, row3.w, row3.h, bbox);
+        const R3 = mapSet(R, row3.x, row3.y, row3.w, row3.h, bbox);
+        const tween3 = tweenPolylines(L3, R3, 5);
+        fillSurfaceBetweenPolylines([L3, ...tween3, R3], '#FFFFFF', 0.5, row3);
+
+        // Row 2: data frame (5×4)
+        drawDataFrameRow(row2.x, row2.y, row2.w, row2.h, histArr, 'last 5');
+
+        // Row 1: red surface if conf>0.8
+        if (conf > CONF_THRESH){
+          const L1 = mapSet(L, row1.x, row1.y, row1.w, row1.h, bbox);
+          const R1 = mapSet(R, row1.x, row1.y, row1.w, row1.h, bbox);
+          const tween1 = tweenPolylines(L1, R1, 5);
+          fillSurfaceBetweenPolylines([L1, ...tween1, R1], '#FF0000', 0.5, row1);
+        }
+
+        // Column label
+        ctx.font = '12px system-ui,-apple-system,Segoe UI,Roboto,Arial';
+        const labelW = ctx.measureText(labelText).width;
+        ctx.fillText(labelText, x + (colW - labelW)/2, Math.min(vh - 6, topY + colH + 14));
+      }
+
+      // Draw the two columns
+      drawColumn(leftX,                 upperPair, confU, histU, 'Upper limb');
+      drawColumn(leftX + colW + colGap, lowerPair, confL, histL, 'Lower limb');
+
+      ctx.restore();
+    }
+
+    // ---------- RIGHT EDGE gallery: exactly ~3cm wide, 10 rows, k-means colored ----------
+    function drawRightGallery(){
+      const vw = canvas.clientWidth, vh = canvas.clientHeight;
+      const isLandscape = vw > vh; if (!isLandscape) return;
+
+      const pad = 12, gap = 8;
+      const cmToPx = 96/2.54;                 // CSS px per cm
+      const rightW = Math.round(cmToPx * 3);  // ≈3cm
+      const rightX = vw - rightW - pad;
+
+      const cols = GALLERY_COLS;  // 1
+      const rows = GALLERY_ROWS;  // 10
+      const cellW = rightW;
+      const cellH = Math.floor((vh - 2*pad - (rows - 1) * gap) / rows);
+
+      ctx.save();
+      ctx.lineWidth = 2;
+
+      // Render cells from newest to oldest (top→bottom)
+      for (let r=0; r<rows; r++){
+        const slot = (galleryIdx - 1 - r + GALLERY_MAX*1000) % GALLERY_MAX;
+        const entry = gallery[slot];
+        const x = rightX, y = pad + r*(cellH + gap);
+
+        // Frame box (transparent background)
+        ctx.globalAlpha = 0.25;
+        ctx.strokeStyle = '#888';
+        ctx.strokeRect(x, y, cellW, cellH);
+        ctx.globalAlpha = 1;
+
+        if (!entry) continue;
+
+        const { cluster } = entry;
+        const meta = CLUSTER_META[cluster] || CLUSTER_META[0];
+        const color = meta.color;
+        const label = `[${cluster}_${meta.name}]`;
+
+        // Reconstruct polylines into the cell
+        const mapBack = (uv) => ({ x: x + uv.u * (cellW - 16) + 8, y: y + uv.v * (cellH - 16) + 8 });
+        const Lline = entry.Luv.map(mapBack);
+        const Rline = entry.Ruv.map(mapBack);
+        const tweens = tweenPolylines(Lline, Rline, 5);
+
+        // Colored surface (cluster color @ 50%)
+        fillSurfaceBetweenPolylines([Lline, ...tweens, Rline], color, 0.5, {x, y, w:cellW, h:cellH});
+
+        // Overlay tweens
+        ctx.strokeStyle = '#ffffff';
+        drawPolyline(Lline, 1.0);
+        for (const t of tweens) drawPolyline(t, 0.7);
+        drawPolyline(Rline, 1.0);
+
+        // Cluster label
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.fillText(label, x + 6, y + 14);
+      }
+
+      ctx.restore();
+    }
+
+    // ---- K-means on collected entries (quick & tiny: data ≤ 10) ----
+    function featureVector(entry){
+      // Flatten [u,v] of both lines into one vector (consistent length: lower limb has 5 pts each)
+      const vec = [];
+      entry.Luv.forEach(p=>{ vec.push(p.u, p.v); });
+      entry.Ruv.forEach(p=>{ vec.push(p.u, p.v); });
+      return vec;
+    }
+    function kmeansAssign(entries, centroids){
+      // returns array of cluster ids
+      return entries.map(e=>{
+        const f = e._feat;
+        let best = 0, bestD = Infinity;
+        for (let k=0; k<centroids.length; k++){
+          const c = centroids[k];
+          let d=0;
+          for (let i=0;i<f.length;i++){ const diff=f[i]-c[i]; d += diff*diff; }
+          if (d<bestD){ bestD=d; best=k; }
+        }
+        return best;
+      });
+    }
+    function kmeans(entries, k=K, iters=10){
+      if (entries.length === 0) return;
+      const dim = entries[0]._feat.length;
+
+      // init centroids: pick first k (or wrap if fewer)
+      const centroids = Array.from({length:k}, (_,i)=>{
+        const src = entries[i % entries.length]._feat;
+        return src.slice();
+      });
+
+      let assign = new Array(entries.length).fill(0);
+      for (let iter=0; iter<iters; iter++){
+        // assign
+        assign = kmeansAssign(entries, centroids);
+        // recompute
+        const sums = Array.from({length:k}, ()=>new Array(dim).fill(0));
+        const counts = new Array(k).fill(0);
+        for (let i=0;i<entries.length;i++){
+          const a = assign[i];
+          const f = entries[i]._feat;
+          counts[a]++;
+          for (let d=0; d<dim; d++) sums[a][d] += f[d];
+        }
+        for (let c=0;c<k;c++){
+          if (counts[c]===0) continue; // keep old centroid
+          for (let d=0; d<dim; d++) centroids[c][d] = sums[c][d]/counts[c];
+        }
+      }
+
+      // write back final assignment
+      assign.forEach((cid, i)=> entries[i].cluster = cid);
+    }
+
+    // Store a LOWER-limb red-surface snapshot into the gallery (normalized), then recluster
+    function collectLowerSnapshot(L_pts, R_pts){
+      const all = [...L_pts, ...R_pts];
+      if (!all.length) return;
+      const minX = Math.min(...all.map(p=>p.x));
+      const maxX = Math.max(...all.map(p=>p.x));
+      const minY = Math.min(...all.map(p=>p.y));
+      const maxY = Math.max(...all.map(p=>p.y));
+      const w = Math.max(1, maxX - minX), h = Math.max(1, maxY - minY);
+
+      const toUV = (p)=>({ u: (p.x - minX)/w, v: (p.y - minY)/h });
+
+      const entry = {
+        Luv: L_pts.map(toUV),
+        Ruv: R_pts.map(toUV),
+        cluster: 0
+      };
+      entry._feat = featureVector(entry);
+
+      gallery[galleryIdx] = entry;
+      galleryIdx = (galleryIdx + 1) % GALLERY_MAX;
+
+      // Recompute clusters on existing (non-null) entries
+      const entries = gallery.filter(Boolean);
+      if (entries.length){
+        // ensure feats present
+        entries.forEach(e=>{ if(!e._feat) e._feat = featureVector(e); });
+        if (entries.length >= 1){
+          kmeans(entries, K, 8);
+        } else {
+          entries[0].cluster = 0;
+        }
+      }
+    }
+
+    function updateHUD(present){
+      hud.textContent = `frames: ${frameCount}/${MAX_FRAMES} | keypoints: ${present}/${KEYPOINTS_TOTAL}`;
+    }
+
+    // ------------- Main render -------------
+    function drawResults(results, POSE_CONNECTIONS){
+      ctx.clearRect(0,0,canvas.clientWidth,canvas.clientHeight);
+
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const isLandscape = vw > vh;
+      const { mapX, mapY } = isLandscape ? drawVideoCover() : drawVideoContain();
+
+      const lms = (results && results.poseLandmarks) || [];
+      let present = 0;
+
+      // Full skeleton + dots + indices
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#ffffff';
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '11px system-ui,-apple-system,Segoe UI,Roboto,Arial';
+
+      for (const [i,j] of POSE_CONNECTIONS){
+        const A = lms[i], B = lms[j];
+        if (!A || !B) continue;
+        if ((A.visibility??1) < VIS_THRESH || (B.visibility??1) < VIS_THRESH) continue;
+        ctx.beginPath();
+        ctx.moveTo(mapX(A.x), mapY(A.y));
+        ctx.lineTo(mapX(B.x), mapY(B.y));
+        ctx.stroke();
+      }
+      for (let idx=0; idx<lms.length; idx++){
+        const p = lms[idx];
+        if (!p) continue;
+        if ((p.visibility??1) >= VIS_THRESH) present++;
+        const x = mapX(p.x), y = mapY(p.y);
+        ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fill();
+        ctx.fillText(String(idx), x+5, y-5);
+      }
+
+      // Limb labels near selected points
+      const upperIdx = [...IDX.L_UPPER, ...IDX.R_UPPER];
+      const lowerIdx = [...IDX.L_LOWER, ...IDX.R_LOWER];
+      function drawKeypointText(indices){
+        ctx.save();
+        ctx.fillStyle = '#ffffff'; ctx.font = '11px system-ui,-apple-system,Segoe UI,Roboto,Arial';
+        indices.forEach(i=>{
+          const p = lms[i]; if (!p) return;
+          const x = mapX(p.x), y = mapY(p.y);
+          const name = LABELS[i] || '';
+          if (name) ctx.fillText(name, x + 6, y - 6);
+        });
+        ctx.restore();
+      }
+      drawKeypointText(upperIdx);
+      drawKeypointText(lowerIdx);
+
+      // Limb polylines on main canvas
+      const L_upper = polyFromIndices(lms, IDX.L_UPPER, mapX, mapY);
+      const R_upper = polyFromIndices(lms, IDX.R_UPPER, mapX, mapY);
+      const L_lower = polyFromIndices(lms, IDX.L_LOWER, mapX, mapY);
+      const R_lower = polyFromIndices(lms, IDX.R_LOWER, mapX, mapY);
+
+      drawPolyline(L_upper, 1); drawPolyline(R_upper, 1);
+      drawPolyline(L_lower, 1); drawPolyline(R_lower, 1);
+
+      // Update histories (5 rows)
+      function averagesFor(indices){ return averagesForSet(lms, indices); }
+      const avgU = averagesFor(upperIdx);
+      const avgL = averagesFor(lowerIdx);
+      pushHist(hist.upper, avgU);
+      pushHist(hist.lower, avgL);
+
+      if (isLandscape){
+        // LEFT HALF columns (bottom-left, height <= 50% of screen)
+        drawLeftHalfColumns(
+          {L:L_upper, R:R_upper},
+          {L:L_lower, R:R_lower},
+          avgU.conf, avgL.conf,
+          hist.upper, hist.lower
+        );
+
+        // Capture lower-limb red shape if conf > 0.8 (for right gallery)
+        if (avgL.conf > CONF_THRESH){
+          collectLowerSnapshot(L_lower, R_lower);
+        }
+
+        // RIGHT gallery (3cm wide, 10 rows, k-means colored)
+        drawRightGallery();
+      }
+
+      // Counters
+      frameCount = (frameCount + 1) % MAX_FRAMES;
+      updateHUD(present);
+    }
+
+    // ------------- Init -------------
+    async function init(){
+      try{
+        clearError();
+
+        // Front camera (prefer 4:3, 60fps)
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: 'user' },
+            width:  { ideal: 1280 },
+            height: { ideal: 960 },          // 4:3 target
+            aspectRatio: { ideal: 4/3 },
+            frameRate: { ideal: 60, max: 60 }
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+
+        await new Promise(res => {
+          if (video.readyState >= 2) return res();
+          video.onloadedmetadata = () => res();
+        });
+
+        sizeCanvas();
+        window.addEventListener('resize', sizeCanvas);
+        window.addEventListener('orientationchange', () => setTimeout(sizeCanvas, 250));
+
+        const api = getPoseAPI();
+        if (!api) throw new Error('MediaPipe Pose failed to load.');
+        const { PoseClass, POSE_CONNECTIONS } = api;
+
+        pose = new PoseClass({
+          locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${f}`
+        });
+        pose.setOptions({
+          modelComplexity: 1,
+          smoothLandmarks: true,
+          refineLandmarks: false,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+        pose.onResults(res => drawResults(res, POSE_CONNECTIONS));
+
+        async function loop(){
+          try { await pose.send({ image: video }); } catch (_) {}
+          rafId = requestAnimationFrame(loop);
+        }
+        loop();
+
+        ui.style.display = 'none';
+      } catch(e){ showError(e); }
+    }
+
+    startBtn.addEventListener('click', init, { once:true });
+
+    window.addEventListener('pagehide', ()=>{
+      if (rafId) cancelAnimationFrame(rafId);
+      if (pose && pose.close) pose.close();
+      const s = video.srcObject;
+      if (s && s.getTracks) s.getTracks().forEach(t=>t.stop());
+    });
+  </script>
+</body>
+</html>
